@@ -1,105 +1,98 @@
 'use strict';
 
-const express = require('express');
-const { Cashfree, CFEnvironment } = require('cashfree-pg');
+const express               = require('express');
+const { getCashfreeClient } = require('./cashfree-client');
 
 const router = express.Router();
 
-// ── Cashfree client (initialised once at module load) ─────────────────────────
-const CF_ENV = process.env.CASHFREE_ENV === 'PRODUCTION'
-  ? CFEnvironment.PRODUCTION
-  : CFEnvironment.SANDBOX;
-
-const cashfree = new Cashfree(
-  CF_ENV,
-  process.env.CASHFREE_APP_ID,
-  process.env.CASHFREE_SECRET_KEY
-);
-
-// ── GET /api/verify-payment ───────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/verify-payment
+// Informs the caller this endpoint requires POST.
+// ─────────────────────────────────────────────────────────────────────────────
 router.get('/verify-payment', (_req, res) => {
   res.status(200).json({
-    success: true,
-    message: 'Use POST /api/verify-payment to verify a payment.',
+    success:        true,
+    message:        'Send a POST request to /api/verify-payment to verify a payment.',
     requiredFields: ['orderId']
   });
 });
 
-// ── POST /api/verify-payment ──────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/verify-payment
+// Fetches order status directly from Cashfree servers.
+// Never trusts any status sent by the client.
+// ─────────────────────────────────────────────────────────────────────────────
 router.post('/verify-payment', async (req, res, next) => {
-  const requestId = req._requestId || `req_${Date.now()}`;
+  const requestId = req.requestId || `rid_${Date.now()}`;
   const startTime = Date.now();
 
   try {
-    const { orderId } = req.body || {};
-
-    if (!orderId || typeof orderId !== 'string' || !orderId.trim()) {
+    // 1. Validate input
+    const orderId = typeof req.body?.orderId === 'string' ? req.body.orderId.trim() : '';
+    if (!orderId) {
       return res.status(400).json({
-        success: false,
-        error: 'orderId is required and must be a non-empty string',
+        success:   false,
+        error:     'orderId is required and must be a non-empty string.',
         requestId
       });
     }
 
-    const response = await cashfree.PGFetchOrder(orderId.trim());
-    const order = response?.data;
+    // 2. Fetch order from Cashfree (server-side — client cannot tamper)
+    const cashfree = getCashfreeClient();
+    const response  = await cashfree.PGFetchOrder(orderId);
+    const order     = response?.data;
 
+    // 3. Guard against empty response
     if (!order) {
-      console.error('[verify-payment] Empty response from Cashfree', { requestId, orderId });
+      console.error(`[verify-payment] Empty response ${requestId} orderId=${orderId}`);
       return res.status(502).json({
-        success: false,
-        error: 'Payment gateway returned an empty response. Please retry.',
+        success:   false,
+        error:     'Payment gateway returned an empty response. Please try again.',
         requestId
       });
     }
 
-    const orderStatus = String(order.order_status || '').toUpperCase();
+    const orderStatus   = String(order.order_status   || 'UNKNOWN').toUpperCase();
     const paymentStatus = String(order.payment_status || 'UNKNOWN').toUpperCase();
 
-    console.info('[verify-payment] FETCHED', {
-      requestId,
-      orderId,
-      orderStatus,
-      paymentStatus,
-      elapsed: `${Date.now() - startTime}ms`
-    });
+    console.info(`[verify-payment] OK ${requestId} orderId=${orderId} paymentStatus=${paymentStatus} (${Date.now() - startTime}ms)`);
 
+    // 4. Return permanent response shape — never changes
     return res.status(200).json({
-      success: paymentStatus === 'SUCCESS',
-      orderId: order.order_id,
+      success:        paymentStatus === 'SUCCESS',
+      orderId:        order.order_id,
       orderStatus,
       paymentStatus,
-      orderAmount: order.order_amount,
-      orderCurrency: order.order_currency,
+      orderAmount:    order.order_amount,
+      orderCurrency:  order.order_currency,
       requestId
     });
 
   } catch (err) {
-    const cfError = err?.response?.data;
-    console.error('[verify-payment] ERROR', {
-      requestId,
-      message: err.message,
-      cashfreeError: cfError,
-      elapsed: `${Date.now() - startTime}ms`
-    });
+    const cfError  = err?.response?.data;
+    const cfStatus = err?.response?.status;
+    console.error(`[verify-payment] ERROR ${requestId}`, err.message, cfError || '');
 
-    if (cfError?.code === 'ORDER_NOT_FOUND' || err?.response?.status === 404) {
+    // Order does not exist in Cashfree
+    if (cfError?.code === 'ORDER_NOT_FOUND' || cfStatus === 404) {
       return res.status(404).json({
-        success: false,
-        error: 'Order not found',
+        success:   false,
+        error:     'Order not found.',
         requestId
       });
     }
 
+    // Cashfree returned a structured error
     if (cfError) {
       return res.status(502).json({
-        success: false,
-        error: 'Payment gateway error',
-        code: cfError.code || 'GATEWAY_ERROR',
+        success:   false,
+        error:     'Payment gateway error.',
+        code:      cfError.code || 'GATEWAY_ERROR',
         requestId
       });
     }
 
+    // Anything else — pass to global error handler
     next(err);
   }
 });
