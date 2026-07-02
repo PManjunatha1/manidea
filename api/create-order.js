@@ -1,83 +1,141 @@
+'use strict';
+
 const express = require('express');
-const dotenv = require('dotenv');
-const { randomUUID } = require('crypto');
+const { randomBytes } = require('crypto');
 const { Cashfree, CFEnvironment } = require('cashfree-pg');
 
-dotenv.config();
-
 const router = express.Router();
-router.use(express.json());
 
-router.get('/create-order', (req, res) => {
-  res.status(200).json({
-    success: true,
-    message: 'Use POST /api/create-order to create a payment order.'
-  });
-});
+// ── Cashfree client (initialised once at module load) ─────────────────────────
+const CF_ENV = process.env.CASHFREE_ENV === 'PRODUCTION'
+  ? CFEnvironment.PRODUCTION
+  : CFEnvironment.SANDBOX;
 
 const cashfree = new Cashfree(
-  CFEnvironment.SANDBOX,
+  CF_ENV,
   process.env.CASHFREE_APP_ID,
   process.env.CASHFREE_SECRET_KEY
 );
 
-router.post('/create-order', async (req, res) => {
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function generateOrderId() {
+  return `ORD_${Date.now()}_${randomBytes(4).toString('hex').toUpperCase()}`;
+}
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const PHONE_RE = /^[6-9]\d{9}$/;
+
+function validateBody(body) {
+  const { customerId, customerName, customerEmail, customerPhone, orderAmount } = body || {};
+  const errors = [];
+
+  if (!customerId || typeof customerId !== 'string' || !customerId.trim())
+    errors.push('customerId is required');
+  if (!customerName || typeof customerName !== 'string' || !customerName.trim())
+    errors.push('customerName is required');
+  if (!customerEmail || !EMAIL_RE.test(customerEmail))
+    errors.push('customerEmail must be a valid email address');
+  if (!customerPhone || !PHONE_RE.test(String(customerPhone)))
+    errors.push('customerPhone must be a valid 10-digit Indian mobile number');
+
+  const amount = Number(orderAmount);
+  if (orderAmount === undefined || orderAmount === null || orderAmount === '')
+    errors.push('orderAmount is required');
+  else if (!Number.isFinite(amount) || amount <= 0)
+    errors.push('orderAmount must be a positive number');
+
+  return { errors, amount };
+}
+
+// ── GET /api/create-order ─────────────────────────────────────────────────────
+router.get('/create-order', (_req, res) => {
+  res.status(200).json({
+    success: true,
+    message: 'Use POST /api/create-order to create a payment order.',
+    requiredFields: ['customerId', 'customerName', 'customerEmail', 'customerPhone', 'orderAmount']
+  });
+});
+
+// ── POST /api/create-order ────────────────────────────────────────────────────
+router.post('/create-order', async (req, res, next) => {
+  const requestId = req._requestId || `req_${Date.now()}`;
+  const startTime = Date.now();
+
   try {
-    const {
-      customerId,
-      customerName,
-      customerEmail,
-      customerPhone,
-      orderAmount
-    } = req.body || {};
+    const { errors, amount } = validateBody(req.body);
 
-    if (!customerId || !customerName || !customerEmail || !customerPhone || orderAmount === undefined) {
+    if (errors.length > 0) {
       return res.status(400).json({
         success: false,
-        message: 'Missing required fields'
+        error: 'Validation Failed',
+        details: errors,
+        requestId
       });
     }
 
-    const amount = Number(orderAmount);
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: 'orderAmount must be a positive number'
-      });
-    }
+    const { customerId, customerName, customerEmail, customerPhone } = req.body;
+    const orderId = generateOrderId();
 
-    const orderId = `ORD_${randomUUID()}`;
-
-    const request = {
+    const orderRequest = {
+      order_id: orderId,
       order_amount: amount,
       order_currency: 'INR',
-      order_id: orderId,
       customer_details: {
-        customer_id: customerId,
-        customer_name: customerName,
-        customer_email: customerEmail,
-        customer_phone: customerPhone
+        customer_id: String(customerId).trim(),
+        customer_name: String(customerName).trim(),
+        customer_email: String(customerEmail).trim().toLowerCase(),
+        customer_phone: String(customerPhone).trim()
       },
       order_meta: {
-        return_url: 'https://www.cashfree.com/devstudio/preview/pg/web/checkout?order_id={order_id}'
+        return_url: `https://manidea.in/payment-status?order_id={order_id}`
       }
     };
 
-    const response = await cashfree.PGCreateOrder(request);
+    const response = await cashfree.PGCreateOrder(orderRequest);
+    const data = response?.data;
+
+    if (!data || !data.payment_session_id) {
+      console.error('[create-order] Cashfree returned no session', { requestId, data });
+      return res.status(502).json({
+        success: false,
+        error: 'Payment gateway did not return a session. Please retry.',
+        requestId
+      });
+    }
+
+    console.info('[create-order] SUCCESS', {
+      requestId,
+      orderId: data.order_id,
+      elapsed: `${Date.now() - startTime}ms`
+    });
 
     return res.status(200).json({
-  success: true,
-  order_id: response.data.order_id,
-  payment_session_id: response.data.payment_session_id,
-  order_status: response.data.order_status
-});
-  } catch (error) {
-    console.error('Cashfree create-order error:', error?.response?.data || error?.message || error);
-
-    return res.status(500).json({
-      success: false,
-      message: 'Failed to create order'
+      success: true,
+      orderId: data.order_id,
+      paymentSessionId: data.payment_session_id,
+      orderStatus: data.order_status,
+      requestId
     });
+
+  } catch (err) {
+    const cfError = err?.response?.data;
+    console.error('[create-order] ERROR', {
+      requestId,
+      message: err.message,
+      cashfreeError: cfError,
+      elapsed: `${Date.now() - startTime}ms`
+    });
+
+    if (cfError) {
+      return res.status(502).json({
+        success: false,
+        error: 'Payment gateway error',
+        code: cfError.code || 'GATEWAY_ERROR',
+        requestId
+      });
+    }
+
+    next(err);
   }
 });
 
