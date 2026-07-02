@@ -1,6 +1,6 @@
 const express = require('express');
 const dotenv = require('dotenv');
-const { v4: uuidv4 } = require('uuid');
+const { randomUUID } = require('crypto');
 const { Cashfree, CFEnvironment } = require('cashfree-pg');
 
 dotenv.config();
@@ -39,7 +39,7 @@ router.post('/create-order', async (req, res) => {
       });
     }
 
-    const orderId = "ORD_" + Date.now();
+    const orderId = `ORD_${randomUUID()}`;
 
     const request = {
       order_amount: amount,
