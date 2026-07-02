@@ -23,7 +23,12 @@ app.use("/api", createOrder);
 app.use("/api", verifyPayment);
 
 const PORT = process.env.PORT || 3000;
+const isVercel = process.env.VERCEL === '1' || process.env.VERCEL === 'true';
 
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
+if (!isVercel) {
+    app.listen(PORT, () => {
+        console.log(`Server running on port ${PORT}`);
+    });
+}
+
+module.exports = app;

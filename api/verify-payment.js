@@ -7,6 +7,13 @@ dotenv.config();
 const router = express.Router();
 router.use(express.json());
 
+router.get('/verify-payment', (req, res) => {
+  res.status(200).json({
+    success: true,
+    message: 'Use POST /api/verify-payment to verify a payment order.'
+  });
+});
+
 const cashfree = new Cashfree(
   CFEnvironment.SANDBOX,
   process.env.CASHFREE_APP_ID,
