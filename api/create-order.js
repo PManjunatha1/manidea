@@ -9,13 +9,9 @@ const router = express.Router();
 // ─────────────────────────────────────────────────────────────────────────────
 // CONSTANTS
 // ─────────────────────────────────────────────────────────────────────────────
-const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-// Valid Indian mobile: 10 digits, first digit 6-9.
+const EMAIL_REGEX    = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const PHONE_10_REGEX = /^[6-9]\d{9}$/;
-
-// Cashfree return URL — {order_id} is replaced by Cashfree automatically.
-const RETURN_URL = 'https://manidea.in/payment-status?order_id={order_id}';
+const RETURN_URL     = 'https://manidea.in/payment-status?order_id={order_id}';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HELPERS
@@ -25,183 +21,140 @@ function generateOrderId() {
   return `ORD_${Date.now()}_${randomBytes(4).toString('hex').toUpperCase()}`;
 }
 
-/**
- * Converts any value to a trimmed string safely.
- * Handles: string, number, null, undefined, boolean.
- * Never returns null or undefined — always returns a string.
- */
+// Safely converts any value to a trimmed string. Never returns null/undefined.
 function toStr(val) {
   if (val === null || val === undefined) return '';
   return String(val).trim();
 }
 
-/**
- * Normalises a phone value to a bare 10-digit Indian number string.
- *
- * Android may send any of these:
- *   "9876543210"       → "9876543210"   (plain string)
- *   "+919876543210"    → "9876543210"   (E.164 string)
- *   "919876543210"     → "9876543210"   (91-prefix string)
- *   9876543210         → "9876543210"   (JSON number)
- *   919876543210       → "9876543210"   (JSON number with 91 prefix)
- *
- * Returns the normalised string. If unrecognised, returns the raw string
- * so the error message shows exactly what was received.
- */
+// Normalises phone to bare 10-digit Indian number.
+// Accepts: "9876543210", "+919876543210", "919876543210", 9876543210 (number type)
 function normalisePhone(raw) {
-  // Convert number type to string first (Android often sends phone as integer)
   const s = toStr(raw).replace(/\s+/g, '').replace(/-/g, '');
-
-  // Already a valid 10-digit number
-  if (PHONE_10_REGEX.test(s)) return s;
-
-  // E.164 format: +91XXXXXXXXXX
-  if (/^\+91[6-9]\d{9}$/.test(s)) return s.slice(3);
-
-  // 91-prefix without +: 91XXXXXXXXXX (12 digits total)
-  if (/^91[6-9]\d{9}$/.test(s)) return s.slice(2);
-
-  // Return as-is so the validation error shows what was actually received
+  if (PHONE_10_REGEX.test(s))          return s;
+  if (/^\+91[6-9]\d{9}$/.test(s))     return s.slice(3);
+  if (/^91[6-9]\d{9}$/.test(s))       return s.slice(2);
   return s;
 }
 
-/**
- * Normalises orderAmount to a finite positive number.
- *
- * Android may send any of these:
- *   500        → 500     (JSON number — most common)
- *   "500"      → 500     (string)
- *   "500.00"   → 500     (string with decimals)
- *   99.99      → 99.99   (float)
- *
- * Returns NaN if the value cannot be parsed as a finite positive number.
- */
+// Normalises amount to a finite positive number.
+// Accepts: 500 (number), "500" (string), "500.00", 99.99
 function normaliseAmount(raw) {
   if (raw === null || raw === undefined || raw === '') return NaN;
-  // Remove commas (locale formatting like "1,000")
   const n = Number(String(raw).trim().replace(/,/g, ''));
   return Number.isFinite(n) ? n : NaN;
 }
 
 /**
+ * Reads a field from the request body accepting BOTH camelCase and snake_case.
+ *
+ * Android may send either format depending on the version of the app.
+ * camelCase key is checked first, snake_case key is the fallback.
+ *
+ * Examples:
+ *   pick(body, 'customerId',    'customer_id')
+ *   pick(body, 'orderAmount',   'order_amount')
+ *   pick(body, 'customerPhone', 'customer_phone')
+ */
+function pick(body, camelKey, snakeKey) {
+  const val = body[camelKey] !== undefined ? body[camelKey] : body[snakeKey];
+  return val;
+}
+
+/**
  * Validates the full request body.
- *
- * Returns:
- *   missingFields  — fields that are absent or empty
- *   invalidFields  — fields present but with wrong format/value
- *   fields         — sanitised, normalised values ready for Cashfree
- *
- * The Android contract (camelCase) is preserved here.
- * Conversion to Cashfree snake_case happens only in the route handler.
+ * Accepts BOTH camelCase and snake_case field names from Android.
+ * Returns missingFields, invalidFields, and sanitised fields object.
  */
 function validateBody(body) {
   const missingFields = [];
   const invalidFields = [];
   const raw = body || {};
 
-  // ── customerId ──────────────────────────────────────────────────────────────
-  const customerId = toStr(raw.customerId);
+  // ── customer_id / customerId ────────────────────────────────────────────────
+  const rawCustomerId = pick(raw, 'customerId', 'customer_id');
+  const customerId    = toStr(rawCustomerId);
   if (!customerId) {
     missingFields.push({
-      field: 'customerId',
-      received: raw.customerId,
-      receivedType: typeof raw.customerId,
-      reason: 'customerId is required and must not be empty.'
+      field:        'customerId / customer_id',
+      received:     rawCustomerId,
+      receivedType: typeof rawCustomerId,
+      reason:       'Required. Send as "customerId" or "customer_id".'
     });
   }
 
-  // ── customerName ────────────────────────────────────────────────────────────
-  const customerName = toStr(raw.customerName);
-  if (!customerName) {
-    missingFields.push({
-      field: 'customerName',
-      received: raw.customerName,
-      receivedType: typeof raw.customerName,
-      reason: 'customerName is required and must not be empty.'
-    });
-  }
+  // ── customer_name / customerName ────────────────────────────────────────────
+  const rawCustomerName = pick(raw, 'customerName', 'customer_name');
+  const customerName    = toStr(rawCustomerName);
+  // customerName is optional — Cashfree accepts empty string
 
-  // ── customerEmail ───────────────────────────────────────────────────────────
-  const customerEmail = toStr(raw.customerEmail).toLowerCase();
-  if (!customerEmail) {
-    missingFields.push({
-      field: 'customerEmail',
-      received: raw.customerEmail,
-      receivedType: typeof raw.customerEmail,
-      reason: 'customerEmail is required.'
-    });
-  } else if (!EMAIL_REGEX.test(customerEmail)) {
+  // ── customer_email / customerEmail ──────────────────────────────────────────
+  const rawCustomerEmail = pick(raw, 'customerEmail', 'customer_email');
+  const customerEmail    = toStr(rawCustomerEmail).toLowerCase();
+  // customerEmail is optional — only validate format if provided
+  if (customerEmail && !EMAIL_REGEX.test(customerEmail)) {
     invalidFields.push({
-      field: 'customerEmail',
-      received: raw.customerEmail,
-      receivedType: typeof raw.customerEmail,
-      reason: `customerEmail format is invalid. Received: "${customerEmail}"`
+      field:        'customerEmail / customer_email',
+      received:     rawCustomerEmail,
+      receivedType: typeof rawCustomerEmail,
+      reason:       `Email format is invalid. Received: "${customerEmail}"`
     });
   }
 
-  // ── customerPhone ───────────────────────────────────────────────────────────
-  // Normalise first, then validate. This handles +91, 91, and plain 10-digit.
-  const rawPhone      = raw.customerPhone;
+  // ── customer_phone / customerPhone ──────────────────────────────────────────
+  const rawPhone      = pick(raw, 'customerPhone', 'customer_phone');
   const customerPhone = normalisePhone(rawPhone);
 
   if (rawPhone === null || rawPhone === undefined || toStr(rawPhone) === '') {
     missingFields.push({
-      field: 'customerPhone',
-      received: rawPhone,
+      field:        'customerPhone / customer_phone',
+      received:     rawPhone,
       receivedType: typeof rawPhone,
-      reason: 'customerPhone is required.'
+      reason:       'Required. Send as "customerPhone" or "customer_phone".'
     });
   } else if (!PHONE_10_REGEX.test(customerPhone)) {
     invalidFields.push({
-      field: 'customerPhone',
-      received: rawPhone,
+      field:        'customerPhone / customer_phone',
+      received:     rawPhone,
       receivedType: typeof rawPhone,
-      normalised: customerPhone,
-      reason: `customerPhone must be a 10-digit Indian mobile number starting with 6-9. ` +
-               `Received: "${rawPhone}" (type: ${typeof rawPhone}), normalised to: "${customerPhone}".`
+      normalised:   customerPhone,
+      reason:       `Must be a 10-digit Indian mobile number (starts 6-9). ` +
+                    `Received: "${rawPhone}" (${typeof rawPhone}), normalised: "${customerPhone}".`
     });
   }
 
-  // ── orderAmount ─────────────────────────────────────────────────────────────
-  const rawAmount = raw.orderAmount;
+  // ── order_amount / orderAmount ──────────────────────────────────────────────
+  const rawAmount = pick(raw, 'orderAmount', 'order_amount');
   const amount    = normaliseAmount(rawAmount);
 
   if (rawAmount === null || rawAmount === undefined || rawAmount === '') {
     missingFields.push({
-      field: 'orderAmount',
-      received: rawAmount,
+      field:        'orderAmount / order_amount',
+      received:     rawAmount,
       receivedType: typeof rawAmount,
-      reason: 'orderAmount is required.'
+      reason:       'Required. Send as "orderAmount" or "order_amount".'
     });
   } else if (isNaN(amount)) {
     invalidFields.push({
-      field: 'orderAmount',
-      received: rawAmount,
+      field:        'orderAmount / order_amount',
+      received:     rawAmount,
       receivedType: typeof rawAmount,
-      reason: `orderAmount must be a number. Received: "${rawAmount}" (type: ${typeof rawAmount}).`
+      reason:       `Must be a number. Received: "${rawAmount}" (${typeof rawAmount}).`
     });
   } else if (amount <= 0) {
     invalidFields.push({
-      field: 'orderAmount',
-      received: rawAmount,
+      field:        'orderAmount / order_amount',
+      received:     rawAmount,
       receivedType: typeof rawAmount,
-      reason: `orderAmount must be greater than 0. Received: ${amount}.`
+      reason:       `Must be greater than 0. Received: ${amount}.`
     });
   }
 
-  const isValid = missingFields.length === 0 && invalidFields.length === 0;
-
   return {
-    isValid,
+    isValid: missingFields.length === 0 && invalidFields.length === 0,
     missingFields,
     invalidFields,
-    fields: {
-      customerId,
-      customerName,
-      customerEmail,
-      customerPhone,
-      amount
-    }
+    fields: { customerId, customerName, customerEmail, customerPhone, amount }
   };
 }
 
@@ -210,11 +163,25 @@ function validateBody(body) {
 // ─────────────────────────────────────────────────────────────────────────────
 router.get('/create-order', (_req, res) => {
   res.status(200).json({
-    success:        true,
-    message:        'Send a POST request to /api/create-order to create a payment order.',
-    requiredFields: ['customerId', 'customerName', 'customerEmail', 'customerPhone', 'orderAmount'],
-    phoneFormats:   ['9876543210', '+919876543210', '919876543210'],
-    amountFormats:  ['500', 500, 99.99]
+    success: true,
+    message: 'POST /api/create-order to create a payment order.',
+    note:    'Both camelCase and snake_case field names are accepted.',
+    acceptedFormats: {
+      camelCase: {
+        customerId:    'string (required)',
+        customerPhone: 'string or number (required)',
+        orderAmount:   'number (required)',
+        customerName:  'string (optional)',
+        customerEmail: 'string (optional)'
+      },
+      snakeCase: {
+        customer_id:    'string (required)',
+        customer_phone: 'string or number (required)',
+        order_amount:   'number (required)',
+        customer_name:  'string (optional)',
+        customer_email: 'string (optional)'
+      }
+    }
   });
 });
 
@@ -225,25 +192,18 @@ router.post('/create-order', async (req, res, next) => {
   const requestId = req.requestId || `rid_${Date.now()}`;
   const startTime = Date.now();
 
-  // ── STEP 1: Log the complete incoming request ──────────────────────────────
-  // Visible in Vercel logs. Shows EXACTLY what Android sent including types.
+  // ── STEP 1: Log complete incoming request ──────────────────────────────────
   console.info('[create-order] INCOMING_REQUEST ' + JSON.stringify({
     requestId,
     timestamp:     new Date().toISOString(),
-    method:        req.method,
-    path:          req.path,
     contentType:   req.headers['content-type'],
     contentLength: req.headers['content-length'],
     userAgent:     req.headers['user-agent'],
     bodyRaw:       req.body,
-    bodyTypes: req.body ? {
-      customerId:    typeof req.body.customerId,
-      customerName:  typeof req.body.customerName,
-      customerEmail: typeof req.body.customerEmail,
-      customerPhone: typeof req.body.customerPhone,
-      orderAmount:   typeof req.body.orderAmount,
-      orderCurrency: typeof req.body.orderCurrency
-    } : null
+    bodyKeys:      req.body ? Object.keys(req.body) : [],
+    bodyTypes:     req.body
+      ? Object.fromEntries(Object.entries(req.body).map(([k, v]) => [k, typeof v]))
+      : {}
   }));
 
   try {
@@ -256,22 +216,24 @@ router.post('/create-order', async (req, res, next) => {
         missingFields,
         invalidFields,
         receivedBody: req.body,
-        elapsed: `${Date.now() - startTime}ms`
+        elapsed:      `${Date.now() - startTime}ms`
       }));
 
       return res.status(400).json({
         success:       false,
-        reason:        'Request validation failed. See missingFields and invalidFields for details.',
+        reason:        'Validation failed. Check missingFields and invalidFields.',
         missingFields,
         invalidFields,
         receivedBody:  req.body,
+        hint:          'Both camelCase (customerId) and snake_case (customer_id) are accepted.',
         requestId
       });
     }
 
     // ── STEP 3: Build Cashfree payload ─────────────────────────────────────────
-    // Android sends camelCase. Cashfree SDK requires snake_case.
-    // Conversion happens ONLY here — Android contract is never changed.
+    // Android sends camelCase OR snake_case.
+    // Cashfree SDK always requires snake_case inside customer_details.
+    // That conversion happens ONLY here.
     const orderId = generateOrderId();
 
     const cashfreePayload = {
@@ -280,8 +242,8 @@ router.post('/create-order', async (req, res, next) => {
       order_currency: 'INR',
       customer_details: {
         customer_id:    fields.customerId,
-        customer_name:  fields.customerName,
-        customer_email: fields.customerEmail,
+        customer_name:  fields.customerName  || '',
+        customer_email: fields.customerEmail || '',
         customer_phone: fields.customerPhone
       },
       order_meta: {
@@ -307,15 +269,12 @@ router.post('/create-order', async (req, res, next) => {
       elapsed:      `${Date.now() - startTime}ms`
     }));
 
-    // ── STEP 5: Guard against empty/incomplete Cashfree response ───────────────
+    // ── STEP 5: Guard empty Cashfree response ──────────────────────────────────
     if (!data || !data.payment_session_id) {
-      console.error('[create-order] NO_SESSION_IN_RESPONSE ' + JSON.stringify({
-        requestId,
-        responseData: data
-      }));
+      console.error('[create-order] NO_SESSION ' + JSON.stringify({ requestId, data }));
       return res.status(502).json({
         success:          false,
-        reason:           'Payment gateway did not return a payment session. Please retry.',
+        reason:           'Payment gateway did not return a session. Please retry.',
         cashfreeResponse: data || null,
         requestId
       });
@@ -341,7 +300,6 @@ router.post('/create-order', async (req, res, next) => {
     const cfError      = err?.response?.data;
     const cfHttpStatus = err?.response?.status;
 
-    // Log everything — stack trace, Cashfree error body, received request body
     console.error('[create-order] EXCEPTION ' + JSON.stringify({
       requestId,
       errorMessage:   err.message,
@@ -352,7 +310,6 @@ router.post('/create-order', async (req, res, next) => {
       elapsed:        `${Date.now() - startTime}ms`
     }));
 
-    // Cashfree returned a structured error (4xx/5xx from Cashfree servers)
     if (cfError) {
       return res.status(502).json({
         success:       false,
@@ -367,7 +324,6 @@ router.post('/create-order', async (req, res, next) => {
       });
     }
 
-    // Missing environment variables
     if (err.message && err.message.includes('CASHFREE_')) {
       return res.status(500).json({
         success: false,
@@ -377,7 +333,6 @@ router.post('/create-order', async (req, res, next) => {
       });
     }
 
-    // Unknown error — pass to global error handler in index.js
     next(err);
   }
 });

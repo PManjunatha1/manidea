@@ -37,7 +37,9 @@ router.post('/verify-payment', async (req, res, next) => {
 
   try {
     // ── STEP 2: Validate ─────────────────────────────────────────────────────
-    const rawOrderId = req.body?.orderId;
+    // Accept both camelCase (orderId) and snake_case (order_id)
+    const body       = req.body || {};
+    const rawOrderId = body.orderId !== undefined ? body.orderId : body.order_id;
     const orderId    = typeof rawOrderId === 'string'
       ? rawOrderId.trim()
       : String(rawOrderId == null ? '' : rawOrderId).trim();
@@ -46,19 +48,21 @@ router.post('/verify-payment', async (req, res, next) => {
       console.warn('[verify-payment] VALIDATION_FAILED ' + JSON.stringify({
         requestId,
         received:     rawOrderId,
-        receivedType: typeof rawOrderId
+        receivedType: typeof rawOrderId,
+        bodyKeys:     Object.keys(body)
       }));
       return res.status(400).json({
         success:       false,
         reason:        'Validation failed.',
         missingFields: [{
-          field:        'orderId',
+          field:        'orderId / order_id',
           received:     rawOrderId,
           receivedType: typeof rawOrderId,
-          reason:       'orderId is required and must be a non-empty string.'
+          reason:       'Required. Send as "orderId" or "order_id".'
         }],
         invalidFields: [],
         receivedBody:  req.body,
+        hint:          'Both camelCase (orderId) and snake_case (order_id) are accepted.',
         requestId
       });
     }
