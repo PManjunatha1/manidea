@@ -2,32 +2,32 @@
 
 const { Cashfree, CFEnvironment } = require('cashfree-pg');
 
-let _client = null;
-
 /**
- * Returns the Cashfree client.
- * Initialised once on first call (lazy) so Vercel cold starts never crash
- * before environment variables are injected.
- * Throws a clear error if credentials are missing.
+ * Creates and returns a Cashfree client.
+ *
+ * WHY no singleton: Vercel serverless functions are stateless. A module-level
+ * variable cached as null on a cold start stays null. Creating the client fresh
+ * on each call costs ~0ms and is the correct pattern for serverless.
+ *
+ * Throws a descriptive Error if credentials are missing so the caller can
+ * return a 500 with a clear message instead of a cryptic SDK crash.
  */
 function getCashfreeClient() {
-  if (_client) return _client;
-
   const appId  = process.env.CASHFREE_APP_ID;
   const secret = process.env.CASHFREE_SECRET_KEY;
 
-  if (!appId || !secret) {
-    throw new Error(
-      'CASHFREE_APP_ID and CASHFREE_SECRET_KEY must be set in environment variables.'
-    );
+  if (!appId || !appId.trim()) {
+    throw new Error('Environment variable CASHFREE_APP_ID is missing or empty.');
+  }
+  if (!secret || !secret.trim()) {
+    throw new Error('Environment variable CASHFREE_SECRET_KEY is missing or empty.');
   }
 
   const env = process.env.CASHFREE_ENV === 'PRODUCTION'
     ? CFEnvironment.PRODUCTION
     : CFEnvironment.SANDBOX;
 
-  _client = new Cashfree(env, appId, secret);
-  return _client;
+  return new Cashfree(env, appId.trim(), secret.trim());
 }
 
 module.exports = { getCashfreeClient };
