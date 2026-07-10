@@ -1,9 +1,11 @@
 'use strict';
 
-require('dotenv').config();
+// dotenv only needed locally — Vercel injects env vars natively
+if (!process.env.VERCEL) require('dotenv').config();
 
 const express = require('express');
 const cors    = require('cors');
+const { randomBytes } = require('crypto');
 
 const createOrderRouter   = require('./api/create-order');
 const verifyPaymentRouter = require('./api/verify-payment');
@@ -12,60 +14,32 @@ const app        = express();
 const START_TIME = Date.now();
 const VERSION    = '1.0.0';
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PROCESS-LEVEL SAFETY NETS
-// Catches anything that escapes all other handlers.
-// Logs the error but keeps the process alive on Vercel serverless.
-// ─────────────────────────────────────────────────────────────────────────────
-process.on('uncaughtException', (err) => {
-  console.error('[FATAL] uncaughtException', err.message, err.stack);
-});
+process.on('uncaughtException',  (err)    => console.error('[FATAL] uncaughtException',  err.message, err.stack));
+process.on('unhandledRejection', (reason) => console.error('[FATAL] unhandledRejection', String(reason)));
 
-process.on('unhandledRejection', (reason) => {
-  console.error('[FATAL] unhandledRejection', String(reason));
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// REQUEST LOGGER
-// Stamps every request with a unique ID and start time.
-// Used by all downstream handlers for tracing.
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Request ID + timing ───────────────────────────────────────────────────────
 app.use((req, _res, next) => {
-  req.requestId  = `rid_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  req.startTime  = Date.now();
+  req.requestId = `rid_${randomBytes(6).toString('hex')}`;
+  req.startTime = Date.now();
   console.info(`[REQ] ${req.requestId} ${req.method} ${req.path}`);
   next();
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CORS
-// Allows all origins. Tighten origin list when you go to production.
-// ─────────────────────────────────────────────────────────────────────────────
-app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'] }));
-app.options('*', cors());
+// ── CORS ──────────────────────────────────────────────────────────────────────
+const corsMiddleware = cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'] });
+app.use(corsMiddleware);
+app.options('*', corsMiddleware);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// JSON BODY PARSER
-// Wrapped manually so a malformed JSON body returns 400 JSON,
-// never an Express HTML error page.
-// ─────────────────────────────────────────────────────────────────────────────
+// ── JSON body parser (compiled once, reused on every request) ─────────────────
+const jsonParser = express.json({ limit: '10kb' });
 app.use((req, res, next) => {
-  express.json({ limit: '10kb' })(req, res, (err) => {
-    if (err) {
-      return res.status(400).json({
-        success:   false,
-        error:     'Request body contains invalid JSON.',
-        requestId: req.requestId
-      });
-    }
+  jsonParser(req, res, (err) => {
+    if (err) return res.status(400).json({ success: false, error: 'Request body contains invalid JSON.', requestId: req.requestId });
     next();
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /
-// Permanent health-check. Shape never changes.
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Health check ──────────────────────────────────────────────────────────────
 app.get('/', (_req, res) => {
   res.status(200).json({
     success:     true,
@@ -79,10 +53,6 @@ app.get('/', (_req, res) => {
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /api
-// Permanent API index. Shape never changes.
-// ─────────────────────────────────────────────────────────────────────────────
 app.get('/api', (_req, res) => {
   res.status(200).json({
     success:       true,
@@ -94,33 +64,17 @@ app.get('/api', (_req, res) => {
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// FEATURE ROUTERS
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Feature routers ───────────────────────────────────────────────────────────
 app.use('/api', createOrderRouter);
 app.use('/api', verifyPaymentRouter);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 404 HANDLER
-// Every unknown route returns JSON. "Cannot GET /x" never appears.
-// ─────────────────────────────────────────────────────────────────────────────
+// ── 404 ───────────────────────────────────────────────────────────────────────
 app.use((req, res) => {
   console.warn(`[404] ${req.requestId} ${req.originalUrl}`);
-  res.status(404).json({
-    success:       false,
-    error:         'Route not found.',
-    requestedPath: req.originalUrl,
-    requestId:     req.requestId
-  });
+  res.status(404).json({ success: false, error: 'Route not found.', requestedPath: req.originalUrl, requestId: req.requestId });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GLOBAL ERROR HANDLER
-// Catches every error passed via next(err) from any route.
-// Never exposes stack traces. Never returns HTML.
-// The 4-argument signature is required by Express to treat this as an
-// error handler — do not remove _next.
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Global error handler ──────────────────────────────────────────────────────
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, _next) => {
   const elapsed = req.startTime ? `${Date.now() - req.startTime}ms` : 'n/a';
@@ -132,14 +86,10 @@ app.use((err, req, res, _next) => {
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// LOCAL DEV SERVER
-// Only starts when running locally. Vercel ignores this block entirely.
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Local dev server ──────────────────────────────────────────────────────────
 if (!process.env.VERCEL) {
   const PORT = Number(process.env.PORT) || 3000;
   app.listen(PORT, () => console.info(`[SERVER] Running on http://localhost:${PORT}`));
 }
 
-// Vercel requires the app to be exported as the default export.
 module.exports = app;
