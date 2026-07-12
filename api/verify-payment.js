@@ -6,76 +6,35 @@ const { getCashfreeClient } = require('./cashfree-client');
 const router = express.Router();
 
 // ── Retry configuration ───────────────────────────────────────────────────────
-// Cashfree updates order/payment status asynchronously after the SDK returns.
-// Strategy: exponential backoff — 1s, 2s, 4s, 8s, 8s (capped at MAX_BACKOFF_MS)
-const MAX_ORDER_RETRIES = 5;
-const BASE_DELAY_MS     = 1000;
-const MAX_BACKOFF_MS    = 8000;
+// Strategy: 3 retries with fixed delays — 500ms, 1000ms, 2000ms (max ~3.5s total)
+// On first SUCCESS, return immediately without waiting.
+const RETRY_DELAYS_MS   = [500, 1000, 2000];
+const MAX_ORDER_RETRIES = RETRY_DELAYS_MS.length + 1; // 4 total attempts (1 initial + 3 retries)
 const TERMINAL_STATUSES = new Set(['SUCCESS', 'FAILED', 'CANCELLED', 'VOID', 'FLAGGED']);
 const PENDING_STATUSES  = new Set(['PENDING', 'UNKNOWN', 'ACTIVE']);
 
-function backoffDelay(attempt) {
-  // attempt is 1-based; delay = BASE * 2^(attempt-1), capped at MAX_BACKOFF_MS
-  return new Promise(resolve =>
-    setTimeout(resolve, Math.min(BASE_DELAY_MS * (1 << (attempt - 1)), MAX_BACKOFF_MS))
-  );
-}
-
-// ── fetchOrderWithRetry ───────────────────────────────────────────────────────
-// Retries PGFetchOrder with exponential backoff until a terminal status is found
-// or MAX_ORDER_RETRIES is exhausted.
-async function fetchOrderWithRetry(cashfree, orderId, requestId) {
-  let lastOrder = null;
-
-  for (let attempt = 1; attempt <= MAX_ORDER_RETRIES; attempt++) {
-    const response = await cashfree.PGFetchOrder(orderId);
-    const order    = response?.data;
-
-    if (!order) {
-      console.warn(`[verify-payment] FETCH_EMPTY attempt=${attempt}/${MAX_ORDER_RETRIES} ` + JSON.stringify({ requestId, orderId }));
-      if (attempt < MAX_ORDER_RETRIES) await backoffDelay(attempt);
-      continue;
-    }
-
-    lastOrder = order;
-
-    const paymentStatus = (order.payment_status || '').toUpperCase();
-    const orderStatus   = (order.order_status   || '').toUpperCase();
-
-    console.info(`[verify-payment] FETCH_ATTEMPT attempt=${attempt}/${MAX_ORDER_RETRIES} ` + JSON.stringify({ requestId, orderId, orderStatus, paymentStatus }));
-
-    if (TERMINAL_STATUSES.has(paymentStatus) || TERMINAL_STATUSES.has(orderStatus)) {
-      console.info(`[verify-payment] TERMINAL_STATUS_FOUND attempt=${attempt} ` + JSON.stringify({ requestId, paymentStatus, orderStatus }));
-      return { order, attempts: attempt };
-    }
-
-    if (attempt < MAX_ORDER_RETRIES) {
-      const delayMs = Math.min(BASE_DELAY_MS * (1 << (attempt - 1)), MAX_BACKOFF_MS);
-      console.info(`[verify-payment] STATUS_PENDING_RETRYING delay=${delayMs}ms attempt=${attempt} ` + JSON.stringify({ requestId }));
-      await backoffDelay(attempt);
-    }
-  }
-
-  return { order: lastOrder, attempts: MAX_ORDER_RETRIES };
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 // ── checkPaymentRecords ───────────────────────────────────────────────────────
-// Cross-checks individual payment records when order status is still PENDING.
-// Payment records update faster than order-level status.
+// Called immediately when PGFetchOrder returns PENDING.
+// Payment-level records update faster than order-level status.
 async function checkPaymentRecords(cashfree, orderId, requestId) {
   try {
     const response = await cashfree.PGOrderFetchPayments(orderId);
     const payments = response?.data;
 
     console.info('[verify-payment] PAYMENT_RECORDS ' + JSON.stringify({
-      requestId, orderId,
+      requestId,
+      orderId,
       paymentCount: Array.isArray(payments) ? payments.length : 0,
       payments
     }));
 
     if (!Array.isArray(payments) || payments.length === 0) return null;
 
-    // Most recent payment record first
+    // Most recent payment first
     const latest = payments.reduce((a, b) =>
       new Date(b.payment_time || 0) > new Date(a.payment_time || 0) ? b : a
     );
@@ -83,7 +42,8 @@ async function checkPaymentRecords(cashfree, orderId, requestId) {
     const paymentStatus = (latest.payment_status || '').toUpperCase();
 
     console.info('[verify-payment] LATEST_PAYMENT_RECORD ' + JSON.stringify({
-      requestId, paymentStatus,
+      requestId,
+      paymentStatus,
       paymentAmount:  latest.payment_amount,
       paymentTime:    latest.payment_time,
       paymentMessage: latest.payment_message
@@ -92,9 +52,120 @@ async function checkPaymentRecords(cashfree, orderId, requestId) {
     return { paymentStatus, paymentRecord: latest };
 
   } catch (err) {
-    console.warn('[verify-payment] PAYMENT_RECORDS_FETCH_FAILED ' + JSON.stringify({ requestId, error: err.message }));
+    console.warn('[verify-payment] PAYMENT_RECORDS_FETCH_FAILED ' + JSON.stringify({
+      requestId,
+      error: err.message
+    }));
     return null;
   }
+}
+
+// ── fetchOrderStatus ──────────────────────────────────────────────────────────
+// Attempt 1: call PGFetchOrder.
+//   - Terminal status → return immediately.
+//   - PENDING         → cross-check PGOrderFetchPayments immediately.
+//     - Payment record SUCCESS → return SUCCESS immediately.
+//     - Still PENDING          → retry up to 3 more times (500ms / 1000ms / 2000ms).
+async function fetchOrderStatus(cashfree, orderId, requestId) {
+  let lastOrder   = null;
+  let attempts    = 0;
+
+  for (let i = 0; i < MAX_ORDER_RETRIES; i++) {
+    // Delay before every attempt except the first
+    if (i > 0) {
+      const delayMs = RETRY_DELAYS_MS[i - 1];
+      console.info('[verify-payment] RETRY_DELAY ' + JSON.stringify({
+        requestId,
+        retryNumber: i,
+        delayMs
+      }));
+      await sleep(delayMs);
+    }
+
+    attempts++;
+
+    let response, order;
+    try {
+      response = await cashfree.PGFetchOrder(orderId);
+      order    = response?.data;
+    } catch (err) {
+      // Re-throw so the route handler can return the exact Cashfree error
+      throw err;
+    }
+
+    if (!order) {
+      console.warn('[verify-payment] FETCH_EMPTY ' + JSON.stringify({
+        requestId,
+        orderId,
+        attempt: attempts,
+        maxAttempts: MAX_ORDER_RETRIES
+      }));
+      continue;
+    }
+
+    lastOrder = order;
+
+    const paymentStatus = (order.payment_status || '').toUpperCase();
+    const orderStatus   = (order.order_status   || '').toUpperCase();
+
+    console.info('[verify-payment] FETCH_ATTEMPT ' + JSON.stringify({
+      requestId,
+      orderId,
+      attempt: attempts,
+      maxAttempts: MAX_ORDER_RETRIES,
+      orderStatus,
+      paymentStatus
+    }));
+
+    // Terminal status found — return immediately, no more waiting
+    if (TERMINAL_STATUSES.has(paymentStatus) || TERMINAL_STATUSES.has(orderStatus)) {
+      console.info('[verify-payment] TERMINAL_STATUS_FOUND ' + JSON.stringify({
+        requestId,
+        attempt: attempts,
+        paymentStatus,
+        orderStatus
+      }));
+      return { order, attempts, resolvedViaPaymentRecord: false };
+    }
+
+    // PENDING — cross-check payment records immediately before next retry
+    if (PENDING_STATUSES.has(paymentStatus) || PENDING_STATUSES.has(orderStatus)) {
+      console.info('[verify-payment] PENDING_CHECKING_PAYMENT_RECORDS ' + JSON.stringify({
+        requestId,
+        orderId,
+        attempt: attempts,
+        orderStatus,
+        paymentStatus
+      }));
+
+      const paymentCheck = await checkPaymentRecords(cashfree, orderId, requestId);
+
+      if (paymentCheck?.paymentStatus === 'SUCCESS') {
+        console.info('[verify-payment] PAYMENT_RECORD_CONFIRMS_SUCCESS ' + JSON.stringify({
+          requestId,
+          orderId,
+          attempt: attempts
+        }));
+        // Patch the order object so the caller gets consistent data
+        order.payment_status = 'SUCCESS';
+        order.order_status   = 'PAID';
+        return { order, attempts, resolvedViaPaymentRecord: true };
+      }
+
+      if (paymentCheck && TERMINAL_STATUSES.has(paymentCheck.paymentStatus)) {
+        console.info('[verify-payment] PAYMENT_RECORD_TERMINAL ' + JSON.stringify({
+          requestId,
+          orderId,
+          attempt: attempts,
+          paymentStatus: paymentCheck.paymentStatus
+        }));
+        order.payment_status = paymentCheck.paymentStatus;
+        return { order, attempts, resolvedViaPaymentRecord: true };
+      }
+    }
+  }
+
+  return { order: lastOrder, attempts, resolvedViaPaymentRecord: false };
 }
 
 // ── Shared Cashfree error handler ─────────────────────────────────────────────
@@ -113,7 +184,12 @@ function handleCashfreeError(err, req, res, context) {
   }));
 
   if (cfError?.code === 'ORDER_NOT_FOUND' || cfHttpStatus === 404) {
-    return res.status(404).json({ success: false, status: 'FAILED', error: 'Order not found in payment gateway.', requestId: req.requestId });
+    return res.status(404).json({
+      success:   false,
+      status:    'FAILED',
+      error:     'Order not found in payment gateway.',
+      requestId: req.requestId
+    });
   }
 
   if (cfError) {
@@ -121,13 +197,23 @@ function handleCashfreeError(err, req, res, context) {
       success:       false,
       status:        'FAILED',
       error:         'Payment gateway error.',
-      cashfreeError: { code: cfError.code || 'UNKNOWN', type: cfError.type || 'UNKNOWN', message: cfError.message || err.message },
-      requestId:     req.requestId
+      cashfreeError: {
+        code:    cfError.code    || 'UNKNOWN',
+        type:    cfError.type    || 'UNKNOWN',
+        message: cfError.message || err.message
+      },
+      requestId: req.requestId
     });
   }
 
   if (err.message && err.message.includes('CASHFREE_')) {
-    return res.status(500).json({ success: false, status: 'FAILED', error: 'Server configuration error. Contact support.', message: err.message, requestId: req.requestId });
+    return res.status(500).json({
+      success:   false,
+      status:    'FAILED',
+      error:     'Server configuration error. Contact support.',
+      message:   err.message,
+      requestId: req.requestId
+    });
   }
 
   return null; // caller should call next(err)
@@ -140,7 +226,7 @@ router.get('/verify-payment', (_req, res) => {
     method:         'POST /api/verify-payment',
     requiredFields: ['orderId'],
     note:           'Both "orderId" and "order_id" are accepted.',
-    retryPolicy:    `Up to ${MAX_ORDER_RETRIES} attempts with exponential backoff (${BASE_DELAY_MS}ms base, ${MAX_BACKOFF_MS}ms cap).`
+    retryPolicy:    `Up to ${MAX_ORDER_RETRIES} attempts. Delays: ${RETRY_DELAYS_MS.join('ms, ')}ms. Payment records checked immediately on PENDING.`
   });
 });
 
@@ -161,10 +247,18 @@ router.post('/verify-payment', async (req, res, next) => {
     // ── Validate ──────────────────────────────────────────────────────────────
     const body       = req.body || {};
     const rawOrderId = body.orderId !== undefined ? body.orderId : body.order_id;
-    const orderId    = (typeof rawOrderId === 'string' ? rawOrderId : String(rawOrderId == null ? '' : rawOrderId)).trim();
+    const orderId    = (typeof rawOrderId === 'string'
+      ? rawOrderId
+      : String(rawOrderId == null ? '' : rawOrderId)
+    ).trim();
 
     if (!orderId) {
-      console.warn('[verify-payment] VALIDATION_FAILED ' + JSON.stringify({ requestId, received: rawOrderId, receivedType: typeof rawOrderId, bodyKeys: Object.keys(body) }));
+      console.warn('[verify-payment] VALIDATION_FAILED ' + JSON.stringify({
+        requestId,
+        received:     rawOrderId,
+        receivedType: typeof rawOrderId,
+        bodyKeys:     Object.keys(body)
+      }));
       return res.status(400).json({
         success:  false,
         error:    'orderId is required.',
@@ -174,57 +268,53 @@ router.post('/verify-payment', async (req, res, next) => {
       });
     }
 
-    // ── Fetch with exponential backoff retry ──────────────────────────────────
     console.info('[verify-payment] STARTING_VERIFICATION ' + JSON.stringify({
-      requestId, orderId,
-      maxRetries:  MAX_ORDER_RETRIES,
-      backoffBase: `${BASE_DELAY_MS}ms`,
-      backoffCap:  `${MAX_BACKOFF_MS}ms`
+      requestId,
+      orderId,
+      maxAttempts:  MAX_ORDER_RETRIES,
+      retryDelays:  RETRY_DELAYS_MS.map(d => `${d}ms`)
     }));
 
-    const cashfree          = getCashfreeClient();
-    const { order, attempts } = await fetchOrderWithRetry(cashfree, orderId, requestId);
+    // ── Fetch with fast retry ─────────────────────────────────────────────────
+    const cashfree = getCashfreeClient();
+    const { order, attempts, resolvedViaPaymentRecord } =
+      await fetchOrderStatus(cashfree, orderId, requestId);
 
     if (!order) {
-      console.error('[verify-payment] ALL_RETRIES_EMPTY ' + JSON.stringify({ requestId, orderId, attempts }));
-      return res.status(502).json({ success: false, status: 'FAILED', error: 'Payment gateway returned no data after all retries.', requestId });
+      console.error('[verify-payment] ALL_RETRIES_EMPTY ' + JSON.stringify({
+        requestId,
+        orderId,
+        attempts
+      }));
+      return res.status(502).json({
+        success:   false,
+        status:    'FAILED',
+        error:     'Payment gateway returned no data after all retries.',
+        requestId
+      });
     }
 
-    let orderStatus   = (order.order_status   || 'UNKNOWN').toUpperCase();
-    let paymentStatus = (order.payment_status || 'UNKNOWN').toUpperCase();
+    const paymentStatus = (order.payment_status || 'UNKNOWN').toUpperCase();
+    const orderStatus   = (order.order_status   || 'UNKNOWN').toUpperCase();
+    const elapsed       = `${Date.now() - startTime}ms`;
 
-    // ── Cross-check payment records if still PENDING ──────────────────────────
-    if (PENDING_STATUSES.has(paymentStatus) || PENDING_STATUSES.has(orderStatus)) {
-      console.info('[verify-payment] CHECKING_PAYMENT_RECORDS ' + JSON.stringify({ requestId, orderId, orderStatus, paymentStatus, attempts }));
+    console.info('[verify-payment] FINAL_RESULT ' + JSON.stringify({
+      requestId,
+      orderId,
+      orderStatus,
+      paymentStatus,
+      attempts,
+      resolvedViaPaymentRecord,
+      elapsed
+    }));
 
-      const paymentCheck = await checkPaymentRecords(cashfree, orderId, requestId);
-
-      if (paymentCheck?.paymentStatus === 'SUCCESS') {
-        paymentStatus = 'SUCCESS';
-        orderStatus   = 'PAID';
-        console.info('[verify-payment] PAYMENT_RECORD_CONFIRMS_SUCCESS ' + JSON.stringify({ requestId, orderId }));
-      } else if (paymentCheck && TERMINAL_STATUSES.has(paymentCheck.paymentStatus)) {
-        paymentStatus = paymentCheck.paymentStatus;
-        console.info('[verify-payment] PAYMENT_RECORD_TERMINAL ' + JSON.stringify({ requestId, orderId, paymentStatus }));
-      }
-    }
-
-    const elapsed = `${Date.now() - startTime}ms`;
-
-    console.info('[verify-payment] FINAL_RESULT ' + JSON.stringify({ requestId, orderId, orderStatus, paymentStatus, attempts, elapsed }));
-
-    // ── Return final confirmed result ─────────────────────────────────────────
-    // Both "status" and "paymentStatus" carry the same value.
-    // Android: result.optString("status", result.optString("paymentStatus", "FAILED"))
+    // ── Return result ─────────────────────────────────────────────────────────
     return res.status(200).json({
       success:       paymentStatus === 'SUCCESS',
       status:        paymentStatus,
       paymentStatus,
       orderStatus,
       orderId:       order.order_id,
-      orderAmount:   order.order_amount,
-      orderCurrency: order.order_currency,
-      attempts,
       elapsed,
       requestId
     });
