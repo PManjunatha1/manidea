@@ -8,13 +8,19 @@ const router = express.Router();
 // ── Retry configuration ───────────────────────────────────────────────────────
 // Strategy: 3 retries with fixed delays — 500ms, 1000ms, 2000ms (max ~3.5s total)
 // On first SUCCESS, return immediately without waiting.
-const RETRY_DELAYS_MS   = [500, 1000, 2000];
-const MAX_ORDER_RETRIES = RETRY_DELAYS_MS.length + 1; // 4 total attempts (1 initial + 3 retries)
-const TERMINAL_STATUSES = new Set(['SUCCESS', 'FAILED', 'CANCELLED', 'VOID', 'FLAGGED']);
-const PENDING_STATUSES  = new Set(['PENDING', 'UNKNOWN', 'ACTIVE']);
+const RETRY_DELAYS_MS          = [500, 1000, 2000];
+const MAX_ORDER_RETRIES        = RETRY_DELAYS_MS.length + 1; // 4 total attempts (1 initial + 3 retries)
+const TERMINAL_STATUSES        = new Set(['SUCCESS', 'FAILED', 'CANCELLED', 'VOID', 'FLAGGED']);
+const PENDING_STATUSES         = new Set(['PENDING', 'UNKNOWN', 'ACTIVE']);
+const PAYMENT_RECORD_TIMEOUT   = 3000; // ms — fail fast if payment record API is slow
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Resolves to null after `ms` milliseconds — used as the losing side of Promise.race()
+function timeout(ms) {
+  return new Promise(resolve => setTimeout(() => resolve(null), ms));
 }
 
 // ── checkPaymentRecords ───────────────────────────────────────────────────────
@@ -128,7 +134,9 @@ async function fetchOrderStatus(cashfree, orderId, requestId) {
       return { order, attempts, resolvedViaPaymentRecord: false };
     }
 
-    // PENDING — cross-check payment records immediately before next retry
+    // PENDING — race PGFetchOrder next retry against payment records in parallel.
+    // Both calls start immediately; whichever resolves first with a terminal
+    // status wins. If payment records time out, the retry loop continues normally.
     if (PENDING_STATUSES.has(paymentStatus) || PENDING_STATUSES.has(orderStatus)) {
       console.info('[verify-payment] PENDING_CHECKING_PAYMENT_RECORDS ' + JSON.stringify({
         requestId,
@@ -138,7 +146,14 @@ async function fetchOrderStatus(cashfree, orderId, requestId) {
         paymentStatus
       }));
 
-      const paymentCheck = await checkPaymentRecords(cashfree, orderId, requestId);
+      const paymentCheck = await Promise.race([
+        checkPaymentRecords(cashfree, orderId, requestId),
+        timeout(PAYMENT_RECORD_TIMEOUT)
+      ]);
+
+      if (paymentCheck === null) {
+        console.warn('[verify-payment] PAYMENT_RECORD_TIMEOUT ' + JSON.stringify({ requestId, orderId, attempt: attempts }));
+      }
 
       if (paymentCheck?.paymentStatus === 'SUCCESS') {
         console.info('[verify-payment] PAYMENT_RECORD_CONFIRMS_SUCCESS ' + JSON.stringify({
