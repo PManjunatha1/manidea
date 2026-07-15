@@ -51,9 +51,9 @@ function validateBody(body) {
 
   const rawPhone      = pick(raw, 'customerPhone', 'customer_phone');
   const customerPhone = normalisePhone(rawPhone);
-  if (rawPhone === null || rawPhone === undefined || toStr(rawPhone) === '') {
-    errors.push({ field: 'customer_phone', message: 'customer_phone is required.', received: rawPhone, receivedType: typeof rawPhone });
-  } else if (!PHONE_10_REGEX.test(customerPhone)) {
+  // Phone is optional for email-login users — Cashfree accepts empty string.
+  // Only validate format if a non-empty value was actually provided.
+  if (toStr(rawPhone) !== '' && !PHONE_10_REGEX.test(customerPhone)) {
     errors.push({ field: 'customer_phone', message: `customer_phone is invalid. Must be a 10-digit Indian mobile number starting with 6-9. Received: "${rawPhone}", normalised: "${customerPhone}".`, received: rawPhone, receivedType: typeof rawPhone });
   }
 
@@ -140,7 +140,7 @@ router.post('/create-order', async (req, res, next) => {
         customer_id:    fields.customerId,
         customer_name:  fields.customerName  || '',
         customer_email: fields.customerEmail || '',
-        customer_phone: fields.customerPhone
+        customer_phone: fields.customerPhone || ''
       },
       order_meta: { return_url: RETURN_URL }
     };
