@@ -51,8 +51,8 @@ function validateBody(body) {
 
   const rawPhone      = pick(raw, 'customerPhone', 'customer_phone');
   const customerPhone = normalisePhone(rawPhone);
-  // Phone is optional for email-login users — Cashfree accepts empty string.
-  // Only validate format if a non-empty value was actually provided.
+  // Phone is optional from Android — email-login users have no phone in Firebase.
+  // Only reject if a value WAS provided but has an invalid format.
   if (toStr(rawPhone) !== '' && !PHONE_10_REGEX.test(customerPhone)) {
     errors.push({ field: 'customer_phone', message: `customer_phone is invalid. Must be a 10-digit Indian mobile number starting with 6-9. Received: "${rawPhone}", normalised: "${customerPhone}".`, received: rawPhone, receivedType: typeof rawPhone });
   }
@@ -140,7 +140,9 @@ router.post('/create-order', async (req, res, next) => {
         customer_id:    fields.customerId,
         customer_name:  fields.customerName  || '',
         customer_email: fields.customerEmail || '',
-        customer_phone: fields.customerPhone || ''
+        // Cashfree mandates a non-empty phone. Use placeholder for email-only
+        // users until the app collects and stores their real phone number.
+        customer_phone: fields.customerPhone || '9999999999'
       },
       order_meta: { return_url: RETURN_URL }
     };
