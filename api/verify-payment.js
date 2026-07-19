@@ -11,7 +11,7 @@ const router = express.Router();
 // Returns as soon as any terminal status is confirmed.
 const RETRY_DELAYS_MS        = [500, 1000, 2000];
 const MAX_ORDER_RETRIES      = RETRY_DELAYS_MS.length + 1; // 4 total
-const TERMINAL_STATUSES      = new Set(['SUCCESS', 'FAILED', 'CANCELLED', 'VOID', 'FLAGGED']);
+const TERMINAL_STATUSES      = new Set(['SUCCESS', 'PAID', 'FAILED', 'CANCELLED', 'VOID', 'FLAGGED']);
 const PENDING_STATUSES       = new Set(['PENDING', 'UNKNOWN', 'ACTIVE']);
 const PAYMENT_RECORD_TIMEOUT = 3000;
 
@@ -119,23 +119,30 @@ async function fetchOrderStatus(cashfree, orderId, requestId, t0) {
     const paymentStatus = (order.payment_status || '').toUpperCase();
     const orderStatus   = (order.order_status   || '').toUpperCase();
 
+    // Normalize: PAID at order level = SUCCESS
+    const effectivePaymentStatus = (orderStatus === 'PAID') ? 'SUCCESS' : paymentStatus;
+    const effectiveOrderStatus   = orderStatus;
+
     console.info('[verify-payment] STEP_FETCH_ORDER ' + JSON.stringify({
       requestId, orderId, attempt: attempts, maxAttempts: MAX_ORDER_RETRIES,
-      orderStatus, paymentStatus,
+      orderStatus: effectiveOrderStatus, paymentStatus: effectivePaymentStatus,
       stepMs: fetchElapsed.ms, totalElapsedMs: since(t0).ms
     }));
 
     // Terminal on order — return immediately
-    if (TERMINAL_STATUSES.has(paymentStatus) || TERMINAL_STATUSES.has(orderStatus)) {
+    if (TERMINAL_STATUSES.has(effectivePaymentStatus) || TERMINAL_STATUSES.has(effectiveOrderStatus)) {
       console.info('[verify-payment] TERMINAL_FOUND_VIA_ORDER ' + JSON.stringify({
-        requestId, attempt: attempts, paymentStatus, orderStatus,
+        requestId, attempt: attempts,
+        paymentStatus: effectivePaymentStatus, orderStatus: effectiveOrderStatus,
         totalElapsedMs: since(t0).ms
       }));
+      order.payment_status = effectivePaymentStatus;
+      order.order_status   = effectiveOrderStatus;
       return { order, attempts, resolvedViaPaymentRecord: false };
     }
 
     // PENDING — check payment records
-    if (PENDING_STATUSES.has(paymentStatus) || PENDING_STATUSES.has(orderStatus)) {
+    if (PENDING_STATUSES.has(effectivePaymentStatus) || PENDING_STATUSES.has(effectiveOrderStatus)) {
       console.info('[verify-payment] ORDER_PENDING_CHECKING_RECORDS ' + JSON.stringify({
         requestId, orderId, attempt: attempts, orderStatus, paymentStatus,
         totalElapsedMs: since(t0).ms
@@ -277,8 +284,12 @@ router.post('/verify-payment', async (req, res, next) => {
       });
     }
 
-    const paymentStatus  = (order.payment_status || 'UNKNOWN').toUpperCase();
-    const orderStatus    = (order.order_status   || 'UNKNOWN').toUpperCase();
+    let paymentStatus  = (order.payment_status || 'UNKNOWN').toUpperCase();
+    let orderStatus    = (order.order_status   || 'UNKNOWN').toUpperCase();
+
+    // orderStatus PAID means Cashfree confirmed the payment — treat as SUCCESS
+    if (orderStatus === 'PAID') paymentStatus = 'SUCCESS';
+
     const totalElapsedMs = Date.now() - t0;
 
     console.info('[verify-payment] T3_RESPONSE_SENT ' + JSON.stringify({
