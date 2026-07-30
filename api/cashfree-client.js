@@ -15,7 +15,7 @@ function getCashfreeClient() {
   if (!appId  || !appId.trim())  throw new Error('Environment variable CASHFREE_APP_ID is missing or empty.');
   if (!secret || !secret.trim()) throw new Error('Environment variable CASHFREE_SECRET_KEY is missing or empty.');
 
-  const env = process.env.CASHFREE_ENV === 'PRODUCTION'
+  const env = (process.env.CASHFREE_ENV || '').toUpperCase() === 'PRODUCTION'
     ? CFEnvironment.PRODUCTION
     : CFEnvironment.SANDBOX;
 

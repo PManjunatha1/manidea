@@ -46,7 +46,7 @@ app.get('/', (_req, res) => {
     server:      'ManIdea Payment Backend',
     status:      'ONLINE',
     version:     VERSION,
-    environment: process.env.CASHFREE_ENV === 'PRODUCTION' ? 'Production' : 'Sandbox',
+    environment: (process.env.CASHFREE_ENV || '').toUpperCase() === 'PRODUCTION' ? 'Production' : 'Sandbox',
     uptime:      `${Math.floor((Date.now() - START_TIME) / 1000)}s`,
     timestamp:   new Date().toISOString(),
     health:      'Healthy'
