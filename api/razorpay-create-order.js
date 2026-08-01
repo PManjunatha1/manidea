@@ -1,9 +1,16 @@
 'use strict';
 
-const express                = require('express');
-const { getRazorpayClient }  = require('./razorpay-client');
+const express               = require('express');
+const { getRazorpayClient } = require('./razorpay-client');
 
 const router = express.Router();
+
+// ── CORS headers for mobile access ───────────────────────────────────────────
+function setCors(res) {
+  res.setHeader('Access-Control-Allow-Origin',  '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function toInt(val) {
@@ -11,8 +18,15 @@ function toInt(val) {
   return isNaN(n) ? NaN : n;
 }
 
+// ── OPTIONS preflight ─────────────────────────────────────────────────────────
+router.options('/razorpay/create-order', (req, res) => {
+  setCors(res);
+  res.sendStatus(204);
+});
+
 // ── GET /api/razorpay/create-order — usage info ───────────────────────────────
 router.get('/razorpay/create-order', (_req, res) => {
+  setCors(res);
   res.status(200).json({
     success: true,
     method:  'POST /api/razorpay/create-order',
@@ -30,6 +44,8 @@ router.post('/razorpay/create-order', async (req, res, next) => {
   const requestId = req.requestId || `rid_${Date.now()}`;
   const startTime = req.startTime || Date.now();
 
+  setCors(res);
+
   console.info('[razorpay-create-order] INCOMING_REQUEST ' + JSON.stringify({
     requestId,
     timestamp:   new Date().toISOString(),
@@ -42,8 +58,8 @@ router.post('/razorpay/create-order', async (req, res, next) => {
   const contentType = req.headers['content-type'] || '';
   if (!contentType.includes('application/json')) {
     return res.status(400).json({
-      success:   false,
-      error:     'Content-Type must be application/json.',
+      success: false,
+      error:   'Content-Type must be application/json.',
       requestId
     });
   }
@@ -89,12 +105,15 @@ router.post('/razorpay/create-order', async (req, res, next) => {
       elapsed:     `${Date.now() - startTime}ms`
     }));
 
+    // key_id returned so Android can initialise the Razorpay SDK without
+    // hardcoding credentials on the client side.
     return res.status(200).json({
       success:  true,
       orderId:  order.id,
       amount:   order.amount,
       currency: order.currency,
       receipt:  order.receipt,
+      key_id:   process.env.RAZORPAY_KEY_ID,
       requestId
     });
 
@@ -104,14 +123,18 @@ router.post('/razorpay/create-order', async (req, res, next) => {
 
     console.error('[razorpay-create-order] EXCEPTION ' + JSON.stringify({
       requestId,
-      errorMessage:    err.message,
-      razorpayStatus:  rzpHttpStatus,
-      razorpayError:   rzpError,
-      elapsed:         `${Date.now() - startTime}ms`
+      errorMessage:   err.message,
+      razorpayStatus: rzpHttpStatus,
+      razorpayError:  rzpError,
+      elapsed:        `${Date.now() - startTime}ms`
     }));
 
     if (rzpHttpStatus === 401) {
-      return res.status(401).json({ success: false, error: 'Razorpay authentication failed. Check API credentials.', requestId });
+      return res.status(401).json({
+        success: false,
+        error:   'Razorpay authentication failed. Check API credentials.',
+        requestId
+      });
     }
 
     if (rzpError) {
@@ -124,7 +147,12 @@ router.post('/razorpay/create-order', async (req, res, next) => {
     }
 
     if (err.message && err.message.includes('RAZORPAY_')) {
-      return res.status(500).json({ success: false, error: 'Server configuration error. Contact support.', message: err.message, requestId });
+      return res.status(500).json({
+        success: false,
+        error:   'Server configuration error. Contact support.',
+        message: err.message,
+        requestId
+      });
     }
 
     next(err);
