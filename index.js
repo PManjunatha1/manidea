@@ -7,8 +7,6 @@ const express = require('express');
 const cors    = require('cors');
 const { randomBytes } = require('crypto');
 
-const createOrderRouter          = require('./api/create-order');
-const verifyPaymentRouter        = require('./api/verify-payment');
 const razorpayCreateOrderRouter  = require('./api/razorpay-create-order');
 const razorpayVerifyPaymentRouter = require('./api/razorpay-verify-payment');
 
@@ -48,7 +46,7 @@ app.get('/', (_req, res) => {
     server:      'ManIdea Payment Backend',
     status:      'ONLINE',
     version:     VERSION,
-    environment: (process.env.CASHFREE_ENV || '').toUpperCase() === 'PRODUCTION' ? 'Production' : 'Sandbox',
+    environment: (process.env.RAZORPAY_KEY_ID || '').startsWith('rzp_live') ? 'Production' : 'Sandbox',
     uptime:      `${Math.floor((Date.now() - START_TIME) / 1000)}s`,
     timestamp:   new Date().toISOString(),
     health:      'Healthy'
@@ -60,17 +58,13 @@ app.get('/api', (_req, res) => {
     success:       true,
     status:        'API ONLINE',
     version:       VERSION,
-    createOrder:              'POST /api/create-order',
-    verifyPayment:            'POST /api/verify-payment',
-    razorpayCreateOrder:      'POST /api/razorpay/create-order',
-    razorpayVerifyPayment:    'POST /api/razorpay/verify-payment',
+    razorpayCreateOrder:   'POST /api/razorpay/create-order',
+    razorpayVerifyPayment: 'POST /api/razorpay/verify-payment',
     documentation: 'Available'
   });
 });
 
 // ── Feature routers ───────────────────────────────────────────────────────────
-app.use('/api', createOrderRouter);
-app.use('/api', verifyPaymentRouter);
 app.use('/api', razorpayCreateOrderRouter);
 app.use('/api', razorpayVerifyPaymentRouter);
 
