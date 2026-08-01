@@ -7,8 +7,10 @@ const express = require('express');
 const cors    = require('cors');
 const { randomBytes } = require('crypto');
 
-const createOrderRouter   = require('./api/create-order');
-const verifyPaymentRouter = require('./api/verify-payment');
+const createOrderRouter          = require('./api/create-order');
+const verifyPaymentRouter        = require('./api/verify-payment');
+const razorpayCreateOrderRouter  = require('./api/razorpay-create-order');
+const razorpayVerifyPaymentRouter = require('./api/razorpay-verify-payment');
 
 const app        = express();
 const START_TIME = Date.now();
@@ -58,8 +60,10 @@ app.get('/api', (_req, res) => {
     success:       true,
     status:        'API ONLINE',
     version:       VERSION,
-    createOrder:   'POST /api/create-order',
-    verifyPayment: 'POST /api/verify-payment',
+    createOrder:              'POST /api/create-order',
+    verifyPayment:            'POST /api/verify-payment',
+    razorpayCreateOrder:      'POST /api/razorpay/create-order',
+    razorpayVerifyPayment:    'POST /api/razorpay/verify-payment',
     documentation: 'Available'
   });
 });
@@ -67,6 +71,8 @@ app.get('/api', (_req, res) => {
 // ── Feature routers ───────────────────────────────────────────────────────────
 app.use('/api', createOrderRouter);
 app.use('/api', verifyPaymentRouter);
+app.use('/api', razorpayCreateOrderRouter);
+app.use('/api', razorpayVerifyPaymentRouter);
 
 // ── 404 ───────────────────────────────────────────────────────────────────────
 app.use((req, res) => {
