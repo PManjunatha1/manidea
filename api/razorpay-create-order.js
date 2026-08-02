@@ -70,9 +70,10 @@ router.post('/razorpay/create-order', async (req, res, next) => {
     const currency = typeof body.currency === 'string' && body.currency.trim()
       ? body.currency.trim().toUpperCase()
       : 'INR';
-    const receipt  = typeof body.receipt === 'string' && body.receipt.trim()
+    const rawReceipt = typeof body.receipt === 'string' && body.receipt.trim()
       ? body.receipt.trim()
       : `receipt_${Date.now()}`;
+    const receipt = rawReceipt.substring(0, 40); // Razorpay max 40 chars
 
     // ── Validate ──────────────────────────────────────────────────────────
     const errors = [];
@@ -159,4 +160,4 @@ router.post('/razorpay/create-order', async (req, res, next) => {
   }
 });
 
-module.exports = router;
+module.exports = router;  
