@@ -2,6 +2,7 @@
 
 const express = require('express');
 const crypto  = require('crypto');
+const { getRazorpayClient } = require('./razorpay-client');
 
 const router = express.Router();
 
@@ -12,25 +13,36 @@ function setCors(res) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 }
 
-// ── OPTIONS preflight ─────────────────────────────────────────────────────────
 router.options('/razorpay/verify-payment', (req, res) => {
   setCors(res);
   res.sendStatus(204);
 });
 
-// ── GET /api/razorpay/verify-payment — usage info ─────────────────────────────
 router.get('/razorpay/verify-payment', (_req, res) => {
   setCors(res);
   res.status(200).json({
     success:        true,
     method:         'POST /api/razorpay/verify-payment',
     requiredFields: ['razorpay_order_id', 'razorpay_payment_id', 'razorpay_signature'],
-    note:           'Signature verified server-side via HMAC-SHA256. KEY_SECRET never leaves the server.'
+    note:           'Two-layer verification: HMAC-SHA256 signature + server-side payment status fetch from Razorpay.'
   });
 });
 
 // ── POST /api/razorpay/verify-payment ─────────────────────────────────────────
-router.post('/razorpay/verify-payment', (req, res) => {
+//
+// LAYER 1 — HMAC-SHA256 signature verification
+//   Proves the payment callback was genuinely issued by Razorpay and was not
+//   tampered with in transit. A forged or replayed callback fails here.
+//
+// LAYER 2 — Server-side payment fetch from Razorpay API
+//   Even if HMAC passes, we independently fetch the payment from Razorpay
+//   servers and confirm status === 'captured'. This prevents a scenario where
+//   an attacker constructs a valid HMAC for a payment that was never captured
+//   (e.g. authorised but not settled, or a test-mode payment replayed in live).
+//
+// Only when BOTH layers pass do we return success: true.
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/razorpay/verify-payment', async (req, res) => {
   const requestId = req.requestId || `rid_${Date.now()}`;
   const startTime = req.startTime || Date.now();
 
@@ -50,7 +62,7 @@ router.post('/razorpay/verify-payment', (req, res) => {
     const paymentId = typeof body.razorpay_payment_id === 'string' ? body.razorpay_payment_id.trim() : '';
     const signature = typeof body.razorpay_signature  === 'string' ? body.razorpay_signature.trim()  : '';
 
-    // ── Validate required fields — 400 if any missing ─────────────────────
+    // ── Validate required fields ──────────────────────────────────────────
     const missing = [];
     if (!orderId)   missing.push('razorpay_order_id');
     if (!paymentId) missing.push('razorpay_payment_id');
@@ -79,60 +91,156 @@ router.post('/razorpay/verify-payment', (req, res) => {
       });
     }
 
-    // ── HMAC-SHA256: HMAC(order_id + "|" + payment_id, KEY_SECRET) ────────
+    // ── LAYER 1: HMAC-SHA256 signature verification ───────────────────────
     const message           = `${orderId}|${paymentId}`;
     const expectedSignature = crypto
       .createHmac('sha256', keySecret.trim())
       .update(message)
       .digest('hex');
 
-    // timingSafeEqual prevents timing attacks; buffers must be same length
-    const sigBuffer      = Buffer.from(signature,          'hex');
-    const expectedBuffer = Buffer.from(expectedSignature,  'hex');
-
-    if (sigBuffer.length !== expectedBuffer.length) {
-      console.warn('[razorpay-verify-payment] SIGNATURE_LENGTH_MISMATCH ' + JSON.stringify({
-        requestId, orderId, paymentId
-      }));
+    // Convert both to Buffer for timingSafeEqual (prevents timing attacks)
+    let sigBuffer, expectedBuffer;
+    try {
+      sigBuffer      = Buffer.from(signature,         'hex');
+      expectedBuffer = Buffer.from(expectedSignature, 'hex');
+    } catch (_) {
+      // Non-hex signature — definitely invalid
+      console.warn('[razorpay-verify-payment] SIGNATURE_INVALID_HEX ' + JSON.stringify({ requestId, orderId, paymentId }));
       return res.status(400).json({
         success: false,
         status:  'FAILED',
-        error:   'Payment signature verification failed. Do not mark as paid.',
+        error:   'Payment verification failed. Signature is not valid hex.',
         requestId
       });
     }
 
-    const isValid = crypto.timingSafeEqual(expectedBuffer, sigBuffer);
-    const elapsed = `${Date.now() - startTime}ms`;
+    if (sigBuffer.length !== expectedBuffer.length || sigBuffer.length === 0) {
+      console.warn('[razorpay-verify-payment] SIGNATURE_LENGTH_MISMATCH ' + JSON.stringify({ requestId, orderId, paymentId }));
+      return res.status(400).json({
+        success: false,
+        status:  'FAILED',
+        error:   'Payment verification failed. Do not mark as paid.',
+        requestId
+      });
+    }
 
-    if (!isValid) {
+    const hmacValid = crypto.timingSafeEqual(expectedBuffer, sigBuffer);
+
+    if (!hmacValid) {
       console.warn('[razorpay-verify-payment] SIGNATURE_MISMATCH ' + JSON.stringify({
-        requestId, orderId, paymentId, elapsed
+        requestId, orderId, paymentId, elapsed: `${Date.now() - startTime}ms`
       }));
       return res.status(400).json({
         success: false,
         status:  'FAILED',
-        error:   'Payment signature verification failed. Do not mark as paid.',
+        error:   'Payment verification failed. Signature mismatch. Do not mark as paid.',
         requestId
       });
     }
 
-    console.info('[razorpay-verify-payment] SIGNATURE_VALID ' + JSON.stringify({
-      requestId, orderId, paymentId, elapsed
+    console.info('[razorpay-verify-payment] LAYER1_HMAC_PASSED ' + JSON.stringify({ requestId, orderId, paymentId }));
+
+    // ── LAYER 2: Fetch payment from Razorpay servers ──────────────────────
+    // We independently confirm the payment status is 'captured'.
+    // 'authorised' means money is held but NOT yet settled — treat as failed.
+    // 'created', 'failed', 'refunded' are all non-success states.
+    const razorpay = getRazorpayClient();
+    let payment;
+
+    try {
+      payment = await razorpay.payments.fetch(paymentId);
+    } catch (fetchErr) {
+      const rzpError      = fetchErr?.error;
+      const rzpHttpStatus = fetchErr?.statusCode;
+
+      console.error('[razorpay-verify-payment] PAYMENT_FETCH_ERROR ' + JSON.stringify({
+        requestId,
+        paymentId,
+        rzpHttpStatus,
+        rzpError,
+        errorMessage: fetchErr.message,
+        elapsed:      `${Date.now() - startTime}ms`
+      }));
+
+      // Payment ID not found in Razorpay — definitely not paid
+      if (rzpHttpStatus === 404) {
+        return res.status(400).json({
+          success: false,
+          status:  'FAILED',
+          error:   'Payment not found in Razorpay. Do not mark as paid.',
+          requestId
+        });
+      }
+
+      return res.status(502).json({
+        success: false,
+        status:  'FAILED',
+        error:   'Could not verify payment with Razorpay. Please retry.',
+        requestId
+      });
+    }
+
+    const paymentStatus = String(payment?.status || '').toLowerCase();
+    const fetchedOrderId = String(payment?.order_id || '').trim();
+
+    console.info('[razorpay-verify-payment] LAYER2_PAYMENT_FETCHED ' + JSON.stringify({
+      requestId,
+      paymentId,
+      paymentStatus,
+      fetchedOrderId,
+      expectedOrderId: orderId,
+      elapsed: `${Date.now() - startTime}ms`
+    }));
+
+    // ── Guard: payment must belong to the claimed order ───────────────────
+    // Prevents an attacker from reusing a captured payment_id from a
+    // different order to unlock a different order.
+    if (fetchedOrderId !== orderId) {
+      console.warn('[razorpay-verify-payment] ORDER_ID_MISMATCH ' + JSON.stringify({
+        requestId, paymentId, fetchedOrderId, claimedOrderId: orderId
+      }));
+      return res.status(400).json({
+        success: false,
+        status:  'FAILED',
+        error:   'Payment does not belong to the claimed order. Do not mark as paid.',
+        requestId
+      });
+    }
+
+    // ── Guard: payment status must be 'captured' ──────────────────────────
+    if (paymentStatus !== 'captured') {
+      console.warn('[razorpay-verify-payment] PAYMENT_NOT_CAPTURED ' + JSON.stringify({
+        requestId, orderId, paymentId, paymentStatus, elapsed: `${Date.now() - startTime}ms`
+      }));
+      return res.status(400).json({
+        success:       false,
+        status:        'FAILED',
+        paymentStatus,
+        error:         `Payment is not captured. Current status: "${paymentStatus}". Do not mark as paid.`,
+        requestId
+      });
+    }
+
+    // ── Both layers passed — payment is genuine and captured ──────────────
+    const elapsed = `${Date.now() - startTime}ms`;
+    console.info('[razorpay-verify-payment] PAYMENT_VERIFIED_SUCCESS ' + JSON.stringify({
+      requestId, orderId, paymentId, paymentStatus, elapsed
     }));
 
     return res.status(200).json({
-      success:   true,
-      status:    'SUCCESS',
+      success:       true,
+      status:        'SUCCESS',
       orderId,
       paymentId,
+      paymentStatus,
+      amount:        payment.amount,
+      currency:      payment.currency,
       elapsed,
       requestId
     });
 
   } catch (err) {
     const elapsed = `${Date.now() - startTime}ms`;
-
     console.error('[razorpay-verify-payment] EXCEPTION ' + JSON.stringify({
       requestId,
       errorMessage: err.message,
