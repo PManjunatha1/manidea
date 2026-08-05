@@ -99,11 +99,14 @@ router.post('/razorpay/create-order', async (req, res, next) => {
     const razorpay = getRazorpayClient();
     const order    = await razorpay.orders.create(payload);
 
-    console.info('[razorpay-create-order] RAZORPAY_RESPONSE ' + JSON.stringify({
+    const elapsed = `${Date.now() - startTime}ms`;
+    console.info('[razorpay-create-order] ORDER_CREATED ' + JSON.stringify({
       requestId,
       orderId:     order.id,
       orderStatus: order.status,
-      elapsed:     `${Date.now() - startTime}ms`
+      amount:      order.amount,
+      currency:    order.currency,
+      elapsed
     }));
 
     // key_id returned so Android can initialise the Razorpay SDK without
